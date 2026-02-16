@@ -65,7 +65,7 @@ def load_model(configs):
 
 def load_vla_checkpoint(model, checkpoint_path):
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     with torch.no_grad():
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=True)
     print("Checkpoint loaded")

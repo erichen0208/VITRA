@@ -236,7 +236,7 @@ class VLAFSDPStrategy(TrainingStrategy):
             return
         
         # Load checkpoint (FSDP handles device placement automatically)
-        optim_state_dict = torch.load(optimizer_path, map_location="cpu")
+        optim_state_dict = torch.load(optimizer_path, map_location="cpu", weights_only=False)
         
         with FSDP.state_dict_type(
             self.vla,

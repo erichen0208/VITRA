@@ -7,6 +7,10 @@ from tqdm import tqdm
 import torch
 from ultralytics import YOLO
 
+# Minimal fix: Patch torch.load to use weights_only=False for PyTorch 2.8.0
+_original_torch_load = torch.load
+torch.load = lambda *args, **kwargs: _original_torch_load(*args, **{**kwargs, 'weights_only': False})
+
 # Dynamically add HaWoR path for local imports
 current_file_dir = os.path.dirname(os.path.abspath(__file__))
 hawor_path = os.path.abspath(os.path.join(current_file_dir, '..', '..', 'thirdparty', 'HaWoR'))
