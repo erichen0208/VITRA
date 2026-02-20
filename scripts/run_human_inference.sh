@@ -28,9 +28,9 @@
 
 python scripts/inference_human_prediction.py \
     --config VITRA-VLA/VITRA-VLA-3B \
-    --image_path ./examples/full_hand.jpg \
+    --image_path ./examples/custom/full_hand.jpg \
     --sample_times 1 \
     --use_left \
-    --video_path ./example_human_inf.mp4 \
+    --video_path ./examples/custom/output.mp4 \
     --mano_path ./weights/mano \
-    --instruction "Left hand: Pick up the mouse. Right hand: None." \
+    --instruction "Left hand: Pick up the mug. Right hand: None." \

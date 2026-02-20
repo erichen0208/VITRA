@@ -194,3 +194,4 @@ benchmark*/
 .DS_Store
 
 examples/custom
+checkpoints/

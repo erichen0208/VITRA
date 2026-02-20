@@ -29,6 +29,12 @@ def load_model(configs):
     model = build_vla(
         configs=configs,
     )
+
+    # Apply LoRA before checkpoint loading (LoRA B=0 → no effect on output)
+    lora_cfg = configs.get("lora")
+    if lora_cfg:
+        model.apply_lora_adapters(lora_cfg)
+
     if model_load_path is not None:
         # Check if model_load_path is a Hugging Face repo (format: "username/repo-name")
         if "/" in model_load_path and not os.path.exists(model_load_path):
@@ -66,8 +72,32 @@ def load_model(configs):
 def load_vla_checkpoint(model, checkpoint_path):
     print(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Smart key remapping for LoRA-wrapped modules:
+    #   checkpoint has "...q_proj.weight" → model has "...q_proj.linear.weight"
+    model_keys = set(model.state_dict().keys())
+    remapped = {}
+    for k, v in checkpoint.items():
+        if k in model_keys:
+            remapped[k] = v
+        else:
+            mapped = False
+            for sfx in ('.weight', '.bias'):
+                if k.endswith(sfx):
+                    new_k = k[:-len(sfx)] + '.linear' + sfx
+                    if new_k in model_keys:
+                        remapped[new_k] = v
+                        mapped = True
+                        break
+            if not mapped:
+                remapped[k] = v
+
     with torch.no_grad():
-        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=True)
+        missing_keys, unexpected_keys = model.load_state_dict(remapped, strict=False)
+    if missing_keys:
+        print(f"  New modules (missing keys): {len(missing_keys)} — {missing_keys[:5]}{'…' if len(missing_keys)>5 else ''}")
+    if unexpected_keys:
+        print(f"  Removed modules (unexpected keys): {len(unexpected_keys)} — {unexpected_keys[:5]}{'…' if len(unexpected_keys)>5 else ''}")
     print("Checkpoint loaded")
     return model
 

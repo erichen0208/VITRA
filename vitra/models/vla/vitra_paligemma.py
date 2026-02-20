@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from typing import Optional, Tuple, List, Callable
 import copy
@@ -51,12 +52,27 @@ class VITRA_Paligemma(nn.Module):
         elif self.action_type == 'keypoints':
             self.hand_dim = 69
 
+        # ── New config: action head type & wrist camera ───────────────────
+        self.action_head_type = configs.get("action_head_type", "diffusion")
+        self.robot_action_dim = configs.get("robot_action_dim", 6)
+        self.robot_state_dim = configs.get("robot_state_dim", 6)
+        self.use_wrist_cam_train = (
+            configs.get("data", {}).get("use_wrist_cam", False)
+            if isinstance(configs.get("data"), dict) else False
+        )
+        wrist_cfg = configs.get("wrist_cam", {})
+        self.wrist_mask_prob = wrist_cfg.get("mask_prob", 0.15)
+
         # Initialize the tokenizer and VLM backbone
         self.tokenizer, self.backbone = self._init_backbone()
         if self.train_setup_configs is not None and self.train_setup_configs.get("reinit", False):
             initialize_param(self.backbone)
 
-        self.act_model = self._init_act_model()
+        # ── Action head (simple MLP or DiT diffusion) ─────────────────────
+        if self.action_head_type == "simple":
+            self.act_model = self._init_simple_action_head()
+        else:
+            self.act_model = self._init_act_model()
 
         if self.use_state == 'VLM':
             self.state_and_mask_dim = 2 * self.configs["state_encoder"]["state_dim"]
@@ -86,6 +102,10 @@ class VITRA_Paligemma(nn.Module):
             self.cognition_token = nn.Parameter(ebd.clone())
         else:
             self.cognition_token = None
+
+        # ── Wrist camera modules ──────────────────────────────────────────
+        if self.use_wrist_cam_train:
+            self._init_wrist_cam_modules()
 
     def _init_backbone(self):
         processor, model = build_vlm(self.configs["vlm"])
@@ -131,6 +151,37 @@ class VITRA_Paligemma(nn.Module):
 
         return action_head
 
+    def _init_simple_action_head(self):
+        """Create simple MLP action head for small action spaces."""
+        from vitra.models.action_model.simple_action_head import SimpleActionHead
+        head_cfg = self.configs.get("simple_action_head", {})
+        use_state = head_cfg.get("use_state", True)
+        head = SimpleActionHead(
+            token_size=self.hidden_size,  # D_llm = 2304
+            action_dim=self.robot_action_dim,
+            chunk_size=self.chunk_size,
+            state_dim=self.robot_state_dim if use_state else 0,
+            hidden_size=head_cfg.get("hidden_size", 512),
+        )
+        self._simple_head_use_state = use_state
+        return head
+
+    def _init_wrist_cam_modules(self):
+        """Create view embeddings, wrist projector (P_w), and missing camera token."""
+        d_vit = self.model.vision_tower.config.hidden_size  # 1152
+        d_llm = self.hidden_size  # 2304
+
+        # View-specific embeddings: added to ViT patch tokens before projection
+        # view 0 = global (cam_head), view 1 = wrist (cam_right_wrist)
+        self.view_embedding = nn.Embedding(2, d_vit)
+        nn.init.normal_(self.view_embedding.weight, mean=0.0, std=0.02)
+
+        # Wrist projector P_w: deep copy of global projector P_g
+        self.wrist_projector = copy.deepcopy(self.model.multi_modal_projector)
+
+        # Missing camera token: replaces wrist image tokens when camera is absent
+        self.missing_cam_token = nn.Parameter(torch.zeros(1, d_llm))
+
     def trainable_params_setup(self):
         model = self.model
         model.config.use_cache = False
@@ -162,6 +213,58 @@ class VITRA_Paligemma(nn.Module):
         if self.cognition_token is not None:
             self.cognition_token.requires_grad_(True)
 
+    def apply_lora_adapters(self, lora_cfg: dict):
+        """Apply LoRA to LLM attention layers. Call after model build."""
+        from vitra.utils.lora import apply_lora
+        target = lora_cfg.get("target_modules", ["q_proj", "v_proj"])
+        rank = lora_cfg.get("rank", 16)
+        alpha = lora_cfg.get("alpha", 32)
+        apply_lora(self.model.language_model, target, rank, alpha)
+        self._has_lora = True
+
+    def set_training_phase(self, phase: str):
+        """Two-phase training for robot fine-tuning.
+
+        phase1 (action expert warm-up):
+            Train: action_head, P_w, view_embed, missing_cam_token,
+                   cognition_token, fov_encoder
+            Freeze: VLM backbone, vision_tower, P_g, LoRA adapters
+
+        phase2 (joint fine-tune):
+            Also unfreeze: P_g + LoRA adapters on LLM
+            Vision encoder stays frozen.
+        """
+        self.model.config.use_cache = False
+
+        # Freeze everything first
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        # Always trainable across both phases
+        self.act_model.requires_grad_(True)
+        if self.cognition_token is not None:
+            self.cognition_token.requires_grad_(True)
+        if self.use_fov:
+            self.fov_encoder.requires_grad_(True)
+
+        # Wrist camera modules
+        if self.use_wrist_cam_train:
+            self.view_embedding.requires_grad_(True)
+            self.wrist_projector.requires_grad_(True)
+            self.missing_cam_token.requires_grad_(True)
+
+        # Phase 2: also unfreeze P_g + LoRA
+        if phase == "phase2":
+            self.model.multi_modal_projector.requires_grad_(True)
+            if getattr(self, '_has_lora', False):
+                from vitra.utils.lora import lora_params
+                for p in lora_params(self):
+                    p.requires_grad_(True)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"[{phase}] Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M")
+
     @property
     def image_processor(self):
         return self.model.processor
@@ -186,6 +289,50 @@ class VITRA_Paligemma(nn.Module):
     def model(self):
         return self.backbone
 
+    def _get_multiview_image_features(self, pixel_values):
+        """Process images through vision tower with view-specific embeddings.
+
+        When wrist cam is enabled:
+          1. Run SigLIP vision tower on all images
+          2. Add view embeddings (global=0, wrist=1) to ViT patch tokens
+          3. Project: global patches → P_g, wrist patches → P_w
+          4. Optionally mask wrist (training only, with wrist_mask_prob)
+          5. Compute alignment loss (training only)
+
+        Returns image features in the same format as model.get_image_features(),
+        so the downstream scatter code works unchanged.
+        """
+        n_views = 2
+        B_total = pixel_values.shape[0]  # B * n_views
+        B = B_total // n_views
+
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
+            vit_output = self.model.vision_tower(pixel_values)
+        vit_features = vit_output.last_hidden_state  # [B*N, n_patches, D_vit]
+
+        n_patches = vit_features.shape[1]
+        d_vit = vit_features.shape[2]
+        vit_features = vit_features.view(B, n_views, n_patches, d_vit)
+
+        # Add view embeddings before projection
+        view_ids = torch.arange(n_views, device=vit_features.device)
+        view_embeds = self.view_embedding(view_ids)  # [2, D_vit]
+        vit_features = vit_features + view_embeds[None, :, None, :]
+
+        # Apply respective projectors
+        global_proj = self.model.multi_modal_projector(vit_features[:, 0])  # [B, 256, D_llm]
+        wrist_proj = self.wrist_projector(vit_features[:, 1])               # [B, 256, D_llm]
+
+        # Mask wrist camera with probability (training only)
+        if self.training and self.wrist_mask_prob > 0:
+            mask = torch.rand(B, device=wrist_proj.device) < self.wrist_mask_prob
+            missing = self.missing_cam_token.unsqueeze(0).expand(B, n_patches, -1)
+            wrist_proj = torch.where(mask[:, None, None], missing, wrist_proj)
+
+        # Combine: [B, 2, n_patches, D_llm] → [B*2, n_patches, D_llm]
+        combined = torch.stack([global_proj, wrist_proj], dim=1)
+        return combined.view(B * n_views, n_patches, -1)
+
     def _forward_act_model(
         self,
         vlm_features: torch.Tensor,
@@ -207,6 +354,21 @@ class VITRA_Paligemma(nn.Module):
 
         B = vlm_features.shape[0]
         action_features = self.extract_cognition_token(vlm_features, attention_mask) #[B, D]
+
+        # ── Simple action head path ───────────────────────────────────────
+        if self.action_head_type == "simple":
+            z = action_features.squeeze(1).to(next(self.act_model.parameters()).dtype)
+            state = current_state if getattr(self, '_simple_head_use_state', False) else None
+            if state is not None:
+                state = state.to(z.dtype)
+            if mode == "train":
+                action_loss = self.act_model.loss(z, action_labels, state=state)
+                return None, action_loss
+            else:
+                actions = self.act_model.predict(z, state=state)
+                return actions, None
+
+        # ── Diffusion head path (original) ────────────────────────────────
         model_dtype = next(self.act_model.net.parameters()).dtype
         action_features = action_features.to(model_dtype)
         
@@ -323,8 +485,11 @@ class VITRA_Paligemma(nn.Module):
         position_ids = cache_position.unsqueeze(0) + 1  # Paligemma positions are 1-indexed
         # Merge text and images
         if pixel_values is not None:
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
-                image_features = self.model.get_image_features(pixel_values)
+            if self.use_wrist_cam_train:
+                image_features = self._get_multiview_image_features(pixel_values)
+            else:
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
+                    image_features = self.model.get_image_features(pixel_values)
 
             special_image_mask = (input_ids == self.model.config.image_token_index).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
@@ -439,7 +604,7 @@ class VITRA_Paligemma(nn.Module):
         image, 
         instruction: str, 
         current_state, 
-        current_state_mask, 
+        current_state_mask=None, 
         use_ddim=True, 
         num_ddim_steps=10, 
         cfg_scale=5.0, 
@@ -451,11 +616,13 @@ class VITRA_Paligemma(nn.Module):
         """
         support B = 1 only for now
         instruction: str
-        current_state: normalized current robot action, [B, D]
-        current_state_mask: [B, D]
-        action_mask_torch: [B, T, D]
+        current_state: normalized current robot state, [B, D]
+        current_state_mask: [B, D] (optional for simple head)
+        action_mask_torch: [B, T, D] (optional for simple head)
         fov: [B, 2]
-        return: predicted normalized robot action, [sample_times, T, D]
+        return: predicted normalized robot action
+               - simple head: [sample_times, T, robot_action_dim]
+               - diffusion head: [sample_times, T, 192]
         """
 
         B = current_state.shape[0]
@@ -468,7 +635,8 @@ class VITRA_Paligemma(nn.Module):
                 image = [Image.fromarray(im) for im in image]
             else:
                 raise ValueError(f"Unsupported image shape: {image.shape}")
-        prefix = '<image>'
+        n_images = len(image) if isinstance(image, list) else 1
+        prefix = '<image>' * n_images
         model_inputs = self.processor(text=prefix + instruction, images=image, return_tensors="pt").to('cuda')
         pixel_value = model_inputs['pixel_values']
         input_ids = model_inputs['input_ids']
@@ -485,6 +653,25 @@ class VITRA_Paligemma(nn.Module):
         if pixel_value.dim() == 5:
             pixel_value = pixel_value.view(-1, *pixel_value.shape[2:])
 
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool).to(input_ids.device)
+        current_state = current_state.to(input_ids.device)
+        fov = fov.to(input_ids.device) if fov is not None else None
+
+        # ── Simple head path ──────────────────────────────────────────────
+        if self.action_head_type == "simple":
+            if current_state_mask is not None:
+                current_state_mask = current_state_mask.to(input_ids.device)
+            output_hs, inputs_masks = self.prepare_vlm_features(
+                pixel_value, input_ids, attention_mask,
+                current_state_mask, current_state, fov, use_cache=use_cache,
+            )
+            z = self.extract_cognition_token(output_hs, inputs_masks).squeeze(1)
+            z = z.to(next(self.act_model.parameters()).dtype)
+            state = current_state.to(z.dtype) if getattr(self, '_simple_head_use_state', False) else None
+            actions = self.act_model.predict(z, state=state)  # [1, T, action_dim]
+            return actions.cpu().numpy()
+
+        # ── Diffusion head path (original) ────────────────────────────────
         if action_mask_torch is None:
             x_mask = torch.zeros(B, self.chunk_size, self.act_model.in_channels, device=input_ids.device)
             # x_mask[:, :, :102] = 1.0 # predict dual hand actions
@@ -493,10 +680,7 @@ class VITRA_Paligemma(nn.Module):
         else:
             x_mask = action_mask_torch.to(input_ids.device)
 
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool).to(input_ids.device)
         current_state_mask = current_state_mask.to(input_ids.device)
-        current_state = current_state.to(input_ids.device)
-        fov = fov.to(input_ids.device) if fov is not None else None
 
         output_hs, inputs_masks = self.prepare_vlm_features(
             pixel_value,
