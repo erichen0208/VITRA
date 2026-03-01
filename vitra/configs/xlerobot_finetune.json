@@ -1,0 +1,83 @@
+{
+    "vla_name": "VITRA_Paligemma",
+    "task_name": "xlerobot_finetune",
+    "model": "vitra_paligemma2",
+    "fwd_pred_next_n": 16,
+    "seed": 42,
+    "batch_size": 4,
+    "pretrain_path": "VITRA-VLA/VITRA-VLA-3B",
+    "model_load_path": null,
+    "resume": false,
+    "use_bf16": true,
+    "use_fov": true,
+    "untied_cognition_token": true,
+    "use_state": null,
+    "loss_type": "robot",
+
+    "robot_action_dim": 7,
+    "robot_state_dim": 7,
+
+    "train_setup": { "freeze_option": "phase1" },
+    "train_dataset": { "action_type": "angle", "normalization": true },
+
+    "state_encoder": { "state_dim": 212 },
+    "action_model": {
+        "model_type": "DiT-B",
+        "token_size": 2304,
+        "action_dim": 192,
+        "hidden_size": 1024,
+        "use_wrist_cross_attn": true
+    },
+
+    "vlm": {
+        "type": "PaliGemmaForConditionalGeneration",
+        "name": "paligemma",
+        "pretrained_model_name_or_path": "google/paligemma2-3b-mix-224"
+    },
+
+    "lora": {
+        "rank": 16,
+        "alpha": 32,
+        "target_modules": ["q_proj", "v_proj"]
+    },
+
+    "repeated_diffusion_steps": 2,
+
+    "data": {
+        "data_dir": "../data_collection_maniskill/data/xlerobot_ycb_random_grasp",
+        "chunk_size": 16,
+        "camera_fov_rad": 1.6,
+        "use_wrist_cam": true
+    },
+
+    "wrist_cam": {
+        "mask_prob": 0.05
+    },
+
+    "training_phases": {
+        "phase1_steps": 3000,
+        "phase2_steps": 12000
+    },
+
+    "trainer": {
+        "learning_rate": 1e-5,
+        "action_model_learning_rate": 5e-5,
+        "gradient_clip_val": 1.0,
+        "weight_decay": 0.01,
+        "warmup_steps": 200,
+        "save_every": 3000,
+        "log_every": 50,
+        "grad_accum": 4,
+        "eval_every": 5000,
+        "eval_episodes": 3
+    },
+
+    "eval": {
+        "robot": "xlerobot",
+        "task": "ycb_eval",
+        "num_episodes": 27,
+        "max_steps": 200,
+        "execute_steps": 4,
+        "gripper_scale": 1.0
+    }
+}

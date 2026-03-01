@@ -124,6 +124,39 @@ class ActionFeature(object):
             'right_hand_6d': (*cls.HUMAN_RIGHT_6D, 1.6),
             'right_hand_joints': (*cls.HUMAN_RIGHT_JOINTS, 0.4),
         }
+
+    @classmethod
+    def get_robot_loss_components(cls):
+        """Loss components for single-arm robot gripper.
+
+        Only right-hand dimensions are active (via mask).  Translation +
+        rotation [51:57] get higher weight than the gripper signal [57:102]
+        because precise pose control is more important for grasping.
+
+        Left-hand components are included for compatibility (they evaluate
+        to zero via the mask) but carry zero weight to be explicit.
+        """
+        return {
+            'left_hand_6d':     (*cls.HUMAN_LEFT_6D, 0.0),
+            'left_hand_joints': (*cls.HUMAN_LEFT_JOINTS, 0.0),
+            'right_hand_6d':    (*cls.HUMAN_RIGHT_6D, 2.0),      # trans + rot: dominant
+            'right_hand_joints': (*cls.HUMAN_RIGHT_JOINTS, 1.0), # gripper
+        }
+
+
+def get_robot_7d_loss_components():
+    """Loss components for native 7-dim single-arm robot (no 192-dim padding).
+
+    State / Action layout: [tx, ty, tz, rx, ry, rz, gripper]
+      - Translation [0:3] — position delta, weight=2.0
+      - Rotation    [3:6] — Euler xyz delta, weight=2.0
+      - Gripper     [6:7] — gripper delta, weight=1.0
+    """
+    return {
+        'translation': (0, 3, 2.0),
+        'rotation':    (3, 6, 2.0),
+        'gripper':     (6, 7, 5.0),   # 5× weight: tiny std amplifies errors
+    }
     
 
 class StateFeature(ActionFeature):

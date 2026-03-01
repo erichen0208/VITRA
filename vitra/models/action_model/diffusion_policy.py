@@ -1,7 +1,7 @@
 from vitra.models.action_model.dit import DiT
 from vitra.models.action_model import create_diffusion
 from . import gaussian_diffusion as gd
-from vitra.datasets.dataset_utils import ActionFeature
+from vitra.datasets.dataset_utils import ActionFeature, get_robot_7d_loss_components
 import torch
 from torch import nn
 
@@ -31,6 +31,7 @@ class DiffusionPolicy(nn.Module):
         diffusion_steps=100,
         state_dim=None,
         loss_type='human',
+        use_wrist_cross_attn=False,
     ):
         super().__init__()
         # SimpleMLP takes in x_t, timestep, and condition, and outputs predicted noise.
@@ -58,7 +59,11 @@ class DiffusionPolicy(nn.Module):
         if loss_type == 'human':
             self.loss_components = ActionFeature.get_loss_components(action_type)
         elif loss_type == 'robot':
+            self.loss_components = ActionFeature.get_robot_loss_components()
+        elif loss_type == 'xhand':
             self.loss_components = ActionFeature.get_xhand_loss_components()
+        elif loss_type == 'robot_7d':
+            self.loss_components = get_robot_7d_loss_components()
         else:
             raise ValueError(f"Unknown loss_type: {loss_type}")
         self.net = DiT_models[model_type](
@@ -69,11 +74,12 @@ class DiffusionPolicy(nn.Module):
             future_action_window_size = future_action_window_size, 
             past_action_window_size = past_action_window_size,
             use_state = use_state,
-            state_dim=state_dim
+            state_dim=state_dim,
+            use_wrist_cross_attn=use_wrist_cross_attn,
         )
 
     # Given condition z and ground truth token x, x_mask, compute loss
-    def loss(self, x, z, x_mask, state=None, state_mask=None):
+    def loss(self, x, z, x_mask, state=None, state_mask=None, wrist_features=None):
         # sample random noise and timestep
         noise = torch.randn_like(x) # [B, T, C]
         timestep = torch.randint(0, self.diffusion.num_timesteps, (x.size(0),), device= x.device)
@@ -84,7 +90,7 @@ class DiffusionPolicy(nn.Module):
         x_t = torch.cat([x_t, x_mask], dim=2) # [B, T, D]
 
         # predict noise from x_t
-        noise_pred = self.net(x_t, timestep, z, state, state_mask)
+        noise_pred = self.net(x_t, timestep, z, state, state_mask, wrist_features=wrist_features)
 
         assert noise_pred.shape == noise.shape == x.shape
 
@@ -130,6 +136,7 @@ class DiffusionPolicy(nn.Module):
             use_ddim,
             num_ddim_steps,
             action_masks,
+            wrist_features=None,
         ):
         B = action_features.shape[0]
         noise = torch.randn(action_features.shape[0], self.future_action_window_size+1, 
@@ -150,17 +157,28 @@ class DiffusionPolicy(nn.Module):
                 model_kwargs = dict(
                     z=z, x_mask=x_mask, 
                     cfg_scale=cfg_scale, state=current_state, 
-                    state_mask=current_state_mask
+                    state_mask=current_state_mask,
+                    wrist_features=wrist_features,
                 )
             else:
-                model_kwargs = dict(z=z, x_mask=x_mask, cfg_scale=cfg_scale)
+                model_kwargs = dict(z=z, x_mask=x_mask, cfg_scale=cfg_scale, wrist_features=wrist_features)
             sample_fn = self.net.forward_with_cfg
         else:
+            z = action_features
+
+            # Without CFG we still need to apply x_mask and concatenate it
+            # before calling DiT.forward(), because forward() expects
+            # x ∈ [B, T, 2D] (action + mask channels), same as in loss().
+            def _fwd_with_mask(x, t, **kwargs):
+                xm = kwargs.pop('x_mask')
+                x_in = torch.cat([x * xm, xm], dim=2)
+                return self.net.forward(x_in, t, **kwargs)
+
             if self.use_state == 'DiT':
-                model_kwargs = dict(z=z, x_mask=x_mask, state=current_state, state_mask=current_state_mask)
+                model_kwargs = dict(z=z, x_mask=x_mask, state=current_state, state_mask=current_state_mask, wrist_features=wrist_features)
             else:
-                model_kwargs = dict(z=z, x_mask=x_mask)
-            sample_fn = self.net.forward
+                model_kwargs = dict(z=z, x_mask=x_mask, wrist_features=wrist_features)
+            sample_fn = _fwd_with_mask
 
         if use_ddim and num_ddim_steps is not None:
             if self.ddim_diffusion is None:

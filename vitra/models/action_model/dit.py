@@ -165,15 +165,56 @@ class LabelEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
+
+class WristCrossAttention(nn.Module):
+    """Cross-attention: Q from DiT action tokens, K/V from wrist spatial tokens.
+
+    Output projection is zero-initialized so the layer contributes nothing at
+    the start of fine-tuning, preserving pre-trained behaviour.
+    """
+
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+        # Zero-init output projection (will be re-applied by DiT.initialize_weights)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x, context):
+        """
+        x:       [B, T, D]  action tokens (query)
+        context: [B, N, D]  wrist spatial tokens (key / value)
+        """
+        B, T, D = x.shape
+        N = context.shape[1]
+
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(context).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(context).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, T, D)
+        out = self.out_proj(out)
+        return out
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    Optionally includes wrist-camera cross-attention (Local Spatial Pathway)
+    inserted between self-attention and FFN.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_wrist_cross_attn=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = MaskAttention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RmsNorm, **block_kwargs)
-        # self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RmsNorm, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -183,7 +224,18 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+        # ── Wrist cross-attention (Local Spatial Pathway) ─────────────────
+        self.use_wrist_cross_attn = use_wrist_cross_attn
+        if use_wrist_cross_attn:
+            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.cross_attn = WristCrossAttention(hidden_size, num_heads)
+            # adaLN modulation for cross-attn: shift, scale, gate
+            self.adaLN_cross = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+            )
+
+    def forward(self, x, c, wrist_tokens=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         seq_len = x.shape[1]
 
@@ -192,10 +244,18 @@ class DiTBlock(nn.Module):
         )
         causal_mask = causal_mask.masked_fill(causal_mask == 1, float("-inf"))
 
+        # Self-attention (unchanged)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), attn_mask=causal_mask)
+
+        # Cross-attention with wrist spatial tokens (Local Spatial Pathway)
+        if self.use_wrist_cross_attn and wrist_tokens is not None:
+            shift_ca, scale_ca, gate_ca = self.adaLN_cross(c).chunk(3, dim=1)
+            x = x + gate_ca.unsqueeze(1) * self.cross_attn(
+                modulate(self.norm_cross(x), shift_ca, scale_ca), wrist_tokens
+            )
+
+        # FFN
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        # x = x + self.attn(self.norm1(x))
-        # x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -237,6 +297,7 @@ class DiT(nn.Module):
         learn_sigma=True,
         use_state=None,
         state_dim=212,
+        use_wrist_cross_attn=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -247,27 +308,24 @@ class DiT(nn.Module):
         self.past_action_window_size = past_action_window_size
         self.future_action_window_size = future_action_window_size
         self.use_state = use_state
+        self.use_wrist_cross_attn = use_wrist_cross_attn
         self.x_embedder = ActionEmbedder(action_size=self.in_channels, hidden_size=hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.z_embedder = LabelEmbedder(in_size=token_size, hidden_size=hidden_size, dropout_prob=class_dropout_prob, conditions_shape=(1, 1, token_size))
         if self.use_state is not None and self.use_state == 'DiT':
             self.state_embedder = StateEmbedder(state_size=state_dim, hidden_size=hidden_size)
-        # num_patches = self.x_embedder.num_patches
-        # # Will use fixed sin-cos embedding:
 
-        # +1 for the conditional token, and 1 for the current action
+        # Positional embedding: z + [state] + action_tokens
+        # (wrist spatial tokens are injected via cross-attention, not in sequence)
         scale = hidden_size ** -0.5
+        n_seq = future_action_window_size + past_action_window_size + 1  # action tokens
+        n_seq += 1  # z_token
         if self.use_state == 'DiT':
-            self.positional_embedding = nn.Parameter(
-                scale * torch.randn(future_action_window_size + past_action_window_size + 3, hidden_size))
-        else:
-            self.positional_embedding = nn.Parameter(
-                    scale * torch.randn(future_action_window_size + past_action_window_size + 2, hidden_size))
-
-        #self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+            n_seq += 1
+        self.positional_embedding = nn.Parameter(scale * torch.randn(n_seq, hidden_size))
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_wrist_cross_attn=use_wrist_cross_attn) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         self.initialize_weights()
@@ -310,6 +368,12 @@ class DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            # Zero-out cross-attention output proj so branch starts as no-op.
+            # Keep adaLN_cross with xavier init (from _basic_init) so that
+            # gate_ca is non-zero → out_proj receives gradients immediately.
+            if block.use_wrist_cross_attn:
+                nn.init.zeros_(block.cross_attn.out_proj.weight)
+                nn.init.zeros_(block.cross_attn.out_proj.bias)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -317,12 +381,14 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x, t, z, state=None, state_mask=None):
+    def forward(self, x, t, z, state=None, state_mask=None, wrist_features=None):
         """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        z: (N,) tensor of conditions
+        Forward pass of DiT (Global-Local Dual-Pathway).
+        x: (N, T, C) noisy action tokens
+        t: (N,) diffusion timesteps
+        z: (N, 1, D_token) VLM cognition token
+        wrist_features: (N, N_patches, D_hidden) optional wrist spatial tokens
+                        for cross-attention (Local Spatial Pathway)
         """
 
         if self.use_state is not None and self.use_state == 'DiT':
@@ -332,44 +398,40 @@ class DiT(nn.Module):
         x = self.x_embedder(x)                   # (N, T, D)
         t = self.t_embedder(t)                   # (N, D)
         z = self.z_embedder(z, self.training)    # (N, 1, D)
-        # t.unsqueeze(1)
-        c = z.squeeze(1) + t                  # (N, 1, D)
+        c = z.squeeze(1) + t                     # (N, D)  — Global Pathway (adaLN)
+
+        # Build sequence: [z, state?, actions]
+        # (wrist spatial tokens are injected via cross-attention, NOT in sequence)
+        tokens = [z]
         if self.use_state is not None and self.use_state == 'DiT':
-            x = torch.cat((z, s, x), dim=1)          # (N, T+2, D)
-        else:
-            x = torch.cat((z, x), dim=1)
-        x = x + self.positional_embedding  # (N, T, D)
+            tokens.append(s)
+        tokens.append(x)
+        x = torch.cat(tokens, dim=1)
+
+        x = x + self.positional_embedding
         for block in self.blocks:
-            x = block(x, c)                      # (N, T+2, D)
-        x = self.final_layer(x, c)               # (N, T+2, out_channels)
+            x = block(x, c, wrist_tokens=wrist_features)
+        x = self.final_layer(x, c)
         return x[:,-(self.future_action_window_size+1):,:]  #[B, T, C]
 
-    #TO DO: Check codes for forward_with_cfg
-    def forward_with_cfg(self, x, t, z, x_mask, cfg_scale, state=None, state_mask=None): #history
-        """
-        Forward pass of Diffusion, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+    def forward_with_cfg(self, x, t, z, x_mask, cfg_scale, state=None, state_mask=None, wrist_features=None):
+        """Forward with classifier-free guidance."""
         half = x[: len(x) // 2]
-        # action_traj = torch.cat([noisy_action, action_mask], dim=2)
         half = half * x_mask
         half = torch.cat([half, x_mask], dim=2)
-        if self.use_state == 'DiT' and state is not None:            
-            state = state
+        # Duplicate wrist features for CFG (conditioned + unconditioned)
+        wf_dup = None
+        if wrist_features is not None:
+            wf_dup = torch.cat([wrist_features, wrist_features], dim=0)
+        combined = torch.cat([half, half], dim=0).to(next(self.x_embedder.parameters()).dtype)
+        if self.use_state == 'DiT' and state is not None:
             state = torch.cat([state, state], dim=0)
-            state_mask = state_mask
             state_mask = torch.cat([state_mask, state_mask], dim=0)
             state = state * state_mask
-            combined = torch.cat([half, half], dim=0).to(next(self.x_embedder.parameters()).dtype)
-            model_out = self.forward(combined, t, z, state, state_mask)
+            model_out = self.forward(combined, t, z, state, state_mask, wrist_features=wf_dup)
         else:
-            combined = torch.cat([half, half], dim=0).to(next(self.x_embedder.parameters()).dtype)
-            model_out = self.forward(combined, t, z)
+            model_out = self.forward(combined, t, z, wrist_features=wf_dup)
 
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         eps, rest = model_out[:, :, :self.in_channels], model_out[:, :, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)

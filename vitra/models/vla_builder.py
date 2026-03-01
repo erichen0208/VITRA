@@ -64,7 +64,7 @@ def load_model(configs):
         else:
             # If it's a directory, look for weights.pt inside
             checkpoint_path = os.path.join(model_load_path, "weights.pt")
-        
+
         model = load_vla_checkpoint(model, checkpoint_path)
 
     return model
@@ -75,27 +75,43 @@ def load_vla_checkpoint(model, checkpoint_path):
 
     # Smart key remapping for LoRA-wrapped modules:
     #   checkpoint has "...q_proj.weight" → model has "...q_proj.linear.weight"
-    model_keys = set(model.state_dict().keys())
+    model_state = model.state_dict()
+    model_keys = set(model_state.keys())
     remapped = {}
+    skipped_shape = []
     for k, v in checkpoint.items():
-        if k in model_keys:
-            remapped[k] = v
-        else:
+        target_key = k
+        if k not in model_keys:
             mapped = False
             for sfx in ('.weight', '.bias'):
                 if k.endswith(sfx):
                     new_k = k[:-len(sfx)] + '.linear' + sfx
                     if new_k in model_keys:
-                        remapped[new_k] = v
+                        target_key = new_k
                         mapped = True
                         break
             if not mapped:
                 remapped[k] = v
+                continue
+
+        # Check shape compatibility — skip mismatches (e.g. replaced DiT I/O layers)
+        if target_key in model_keys and model_state[target_key].shape != v.shape:
+            skipped_shape.append(
+                f"  {target_key}: ckpt={list(v.shape)} vs model={list(model_state[target_key].shape)}"
+            )
+            continue
+
+        remapped[target_key] = v
+
+    if skipped_shape:
+        print(f"  Shape mismatches (skipped, randomly initialised):")
+        for s in skipped_shape:
+            print(s)
 
     with torch.no_grad():
         missing_keys, unexpected_keys = model.load_state_dict(remapped, strict=False)
     if missing_keys:
-        print(f"  New modules (missing keys): {len(missing_keys)} — {missing_keys[:5]}{'…' if len(missing_keys)>5 else ''}")
+        print(f"  New modules (missing keys): {len(missing_keys)} — {missing_keys[:8]}{'…' if len(missing_keys)>8 else ''}")
     if unexpected_keys:
         print(f"  Removed modules (unexpected keys): {len(unexpected_keys)} — {unexpected_keys[:5]}{'…' if len(unexpected_keys)>5 else ''}")
     print("Checkpoint loaded")

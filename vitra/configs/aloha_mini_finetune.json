@@ -1,38 +1,20 @@
 {
     "vla_name": "VITRA_Paligemma",
-    "task_name": "aloha_mini_finetune",
-    "model": "vitra_paligemma2",
+    "task_name": "AlohaMiniGrasp",
     "fwd_pred_next_n": 16,
     "seed": 42,
     "batch_size": 4,
-    "pretrain_path": "VITRA-VLA/VITRA-VLA-3B",
-    "model_load_path": null,
-    "resume": false,
     "use_bf16": true,
     "use_fov": true,
     "untied_cognition_token": true,
-    "use_state": null,
-    "loss_type": "robot",
+    "use_state": "DiT",
+    "repeated_diffusion_steps": 8,
 
-    "action_head_type": "simple",
-    "robot_action_dim": 6,
-    "robot_state_dim": 6,
+    "model_load_path": "VITRA-VLA/VITRA-VLA-3B",
 
-    "train_setup": { "freeze_option": "phase1" },
-    "train_dataset": { "action_type": "angle", "normalization": true },
-
-    "state_encoder": { "state_dim": 212 },
-    "action_model": {
-        "model_type": "DiT-B",
-        "token_size": 2304,
-        "action_dim": 192,
-        "hidden_size": 1024
-    },
-
-    "simple_action_head": {
-        "hidden_size": 512,
-        "use_state": true
-    },
+    "action_dim": 7,
+    "state_dim": 7,
+    "loss_type": "robot_7d",
 
     "vlm": {
         "type": "PaliGemmaForConditionalGeneration",
@@ -40,49 +22,82 @@
         "pretrained_model_name_or_path": "google/paligemma2-3b-mix-224"
     },
 
-    "lora": {
-        "rank": 16,
-        "alpha": 32,
-        "target_modules": ["q_proj", "v_proj"]
+    "action_model": {
+        "model_type": "DiT-B",
+        "token_size": 2304,
+        "action_dim": 7,
+        "use_state": true,
+        "use_wrist_cross_attn": true
     },
 
-    "repeated_diffusion_steps": 2,
-
-    "data": {
-        "data_dir": "../data_collection_maniskill/data/aloha_mini_ycb_random_grasp",
-        "chunk_size": 16,
-        "camera_fov_rad": 1.6,
-        "use_wrist_cam": true
+    "state_encoder": {
+        "state_dim": 7,
+        "state_key": "current_state",
+        "state_mask_key": "current_state_mask"
     },
 
     "wrist_cam": {
-        "mask_prob": 0.15
+        "encoder": "resnet34",
+        "in_channels": 4,
+        "image_size": 224,
+        "freeze_backbone": true,
+        "output_dim": 768,
+        "mask_prob": 0.2,
+        "pool_size": 7
+    },
+
+    "train_setup": {
+        "freeze_option": "freeze_vision_encoder"
+    },
+
+    "lora": {
+        "target_modules": ["q_proj", "v_proj"],
+        "rank": 16,
+        "alpha": 32
     },
 
     "training_phases": {
-        "phase1_steps": 2000,
-        "phase2_steps": 4000
+        "phase1_steps": 3000,
+        "phase2_steps": 18000
     },
 
     "trainer": {
-        "learning_rate": 1e-5,
-        "action_model_learning_rate": 1e-4,
-        "gradient_clip_val": 1.0,
+        "learning_rate": 1e-4,
+        "lr_dit_blocks": 5e-5,
+        "lr_new_io": 2e-4,
+        "lr_lora_pg": 1e-4,
         "weight_decay": 0.01,
-        "warmup_steps": 100,
-        "save_every": 1000,
-        "log_every": 50,
-        "grad_accum": 4,
-        "eval_every": 2000,
-        "eval_episodes": 8
+        "gradient_clip_val": 1.0,
+        "warmup_steps": 200,
+        "max_steps": 21000,
+        "save_every": 3000,
+        "log_every": 100,
+        "eval_every": 3000,
+        "eval_episodes": 1,
+        "grad_accum": 4
+    },
+
+    "train_dataset": {
+        "action_type": "angle"
+    },
+
+    "data": {
+        "data_dir": "../data_collection_maniskill/data/aloha_mini_ycb_random_grasp",
+        "camera_fov_rad": 1.6,
+        "cam_head_col": "observation.images.cam_head",
+        "cam_wrist_rgb_col": "observation.images.cam_right_wrist",
+        "cam_wrist_depth_col": "observation.depth.cam_right_wrist"
     },
 
     "eval": {
         "robot": "aloha_mini",
-        "task": "ycb_random",
-        "num_episodes": 20,
+        "num_episodes": 9,
         "max_steps": 200,
-        "execute_steps": 4,
-        "gripper_scale": 1.0
+        "execute_steps": 2,
+        "gripper_scale": 1.0,
+        "rotation_weight": 0.3,
+        "ik_damping": 0.05,
+        "ddim_steps": 10,
+        "cfg_scale": 2.0
     }
 }

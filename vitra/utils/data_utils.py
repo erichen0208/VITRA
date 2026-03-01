@@ -177,8 +177,11 @@ class PaddedCollatorForHandPrediction:
         fov = [instance["fov"] for instance in instances]
         fov = torch.stack(fov)
 
-        intrinsics = [instance["intrinsics"] for instance in instances]
-        intrinsics = torch.stack(intrinsics)
+        intrinsics = [instance.get("intrinsics") for instance in instances]
+        if intrinsics[0] is not None:
+            intrinsics = torch.stack(intrinsics)
+        else:
+            intrinsics = None
 
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
@@ -257,6 +260,19 @@ class PaddedCollatorForHandPrediction:
 
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
+        # Wrist camera (separate from VLM pixel_values, for action head)
+        if "wrist_pixel_values" in instances[0] and instances[0]["wrist_pixel_values"] is not None:
+            wpv = [inst["wrist_pixel_values"] for inst in instances]
+            output["wrist_pixel_values"] = torch.stack(wpv)
+
+        if "wrist_depth" in instances[0] and instances[0]["wrist_depth"] is not None:
+            wd = [inst["wrist_depth"] for inst in instances]
+            output["wrist_depth"] = torch.stack(wd)
+
+        if "wrist_rgbd" in instances[0] and instances[0]["wrist_rgbd"] is not None:
+            wrgbd = [inst["wrist_rgbd"] for inst in instances]
+            output["wrist_rgbd"] = torch.stack(wrgbd)
     
         return output
 
