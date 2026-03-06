@@ -154,13 +154,14 @@ class VITRA_Paligemma(nn.Module):
     def _init_wrist_action_modules(self):
         """Wrist camera RGBD → DiT cross-attention (Local Spatial Pathway).
 
-        Supports two encoder backends (selected by config wrist_cam.encoder):
-        - "dinov2_vitb14": DINOv2 ViT-B/14 (768-d, 16×16 patches from 224px).
-        - "resnet34":     ResNet-34      (512-d,  7×7  spatial from 224px).
+        Supports three encoder configurations:
+        - "dinov2_vitb14": DINOv2 ViT-B/14 for RGB + optional lightweight CNN
+          for depth. RGB and depth are encoded separately and combined.
+        - "resnet34":     ResNet-34 modified for 4-channel RGBD input.
 
-        Both are modified for 4-channel RGBD input.  The RGB channels reuse
-        pretrained ImageNet weights; the depth channel is zero-initialised so
-        it begins as a no-op and gradually learns during fine-tuning.
+        When depth_encoder="lightweight_cnn" (in wrist_cam config), depth is
+        encoded by a small CNN and added to the DINO RGB features.
+        Otherwise, the encoder handles all 4 channels jointly.
 
         Output: [B, N, D_hidden] spatial tokens fed as K,V into each
         DiTBlock's WristCrossAttention layer.
@@ -170,6 +171,7 @@ class VITRA_Paligemma(nn.Module):
         wrist_cfg = self.configs.get("wrist_cam", {})
         image_size = wrist_cfg.get("image_size", 224)
         freeze_backbone = wrist_cfg.get("freeze_backbone", True)
+        depth_encoder_type = wrist_cfg.get("depth_encoder", None)
 
         # DiT hidden size (read from actually-constructed DiT)
         dit_hidden = self.act_model.net.blocks[0].attn.qkv.in_features  # 768 for DiT-B
@@ -211,41 +213,64 @@ class VITRA_Paligemma(nn.Module):
             self.wrist_num_patches_raw = self.wrist_grid_size ** 2  # 49
 
         else:
-            # ── DINOv2 ViT-B/14, modified for 4-channel RGBD input ──────
-            self.wrist_rgbd_encoder = timm.create_model(
+            # ── DINOv2 ViT-B/14 for RGB (frozen) ────────────────────────
+            self.wrist_rgb_encoder = timm.create_model(
                 "vit_base_patch14_dinov2.lvd142m",
                 pretrained=True,
                 img_size=image_size,
                 num_classes=0,  # remove classification head
             )
 
-            # Modify patch embedding: 3ch → 4ch  (zero-init depth channel)
-            old_proj = self.wrist_rgbd_encoder.patch_embed.proj
-            new_proj = nn.Conv2d(
-                4, old_proj.out_channels,
-                kernel_size=old_proj.kernel_size,
-                stride=old_proj.stride,
-                bias=(old_proj.bias is not None),
-            )
-            with torch.no_grad():
-                new_proj.weight[:, :3] = old_proj.weight
-                new_proj.weight[:, 3:] = 0.0          # depth starts as no-op
-                if old_proj.bias is not None:
-                    new_proj.bias.copy_(old_proj.bias)
-            self.wrist_rgbd_encoder.patch_embed.proj = new_proj
-
-            # Freeze backbone — only patch-embed is trainable (depth channel)
+            # Freeze DINO backbone entirely — strong pretrained RGB features
             if freeze_backbone:
-                for param in self.wrist_rgbd_encoder.parameters():
+                for param in self.wrist_rgb_encoder.parameters():
                     param.requires_grad = False
-                for param in self.wrist_rgbd_encoder.patch_embed.parameters():
-                    param.requires_grad = True
 
-            encoder_dim = self.wrist_rgbd_encoder.embed_dim  # 768 for ViT-B
-            # ViT-B/14 with 224 → 16×16 = 256 patches
-            patch_size = self.wrist_rgbd_encoder.patch_embed.proj.kernel_size[0]
+            dino_dim = self.wrist_rgb_encoder.embed_dim  # 768 for ViT-B
+            patch_size = self.wrist_rgb_encoder.patch_embed.proj.kernel_size[0]  # 14
             self.wrist_grid_size = image_size // patch_size          # 16
             self.wrist_num_patches_raw = self.wrist_grid_size ** 2   # 256
+
+            # ── Lightweight CNN for depth (1-channel, fully trainable) ───
+            # Produces spatial features at the same grid size as DINO patches.
+            # Input: [B, 1, 224, 224]  →  Output: [B, dino_dim, 16, 16]
+            # Architecture: 4 conv blocks  224→112→56→28→14  then 1×1 proj
+            # Actually we want 224 / 14 = 16, so final feature map is 16×16
+            # 224 → 56 (s4) → 14 (s4) gives 14, not 16. Let's use stride
+            # progression that matches: 224/14=16, so need total stride 14.
+            # Use: s2 → s1(p) → s2 → s1(p) → adaptive pool to grid_size
+            depth_mid = 64
+            self.wrist_depth_encoder = nn.Sequential(
+                # Block 1: 1→32, 224→112
+                nn.Conv2d(1, 32, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                # Block 2: 32→64, 112→56
+                nn.Conv2d(32, depth_mid, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(depth_mid),
+                nn.ReLU(inplace=True),
+                # Block 3: 64→128, 56→28
+                nn.Conv2d(depth_mid, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                # Block 4: 128→256, 28→14
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                # Adaptive pool to match DINO grid size (16×16)
+                nn.AdaptiveAvgPool2d(self.wrist_grid_size),
+                # 1×1 conv to project to DINO feature dim
+                nn.Conv2d(256, dino_dim, kernel_size=1, bias=False),
+            )
+
+            # ── Depth-to-RGB fusion gate ─────────────────────────────────
+            # Learned gating: fused = rgb + gate * depth  (gate starts ~0)
+            self.wrist_depth_gate = nn.Parameter(torch.zeros(1, 1, dino_dim))
+
+            encoder_dim = dino_dim  # combined output dim = dino_dim
+
+            # Legacy compat: set wrist_rgbd_encoder to None so we know it's split
+            self.wrist_rgbd_encoder = None
 
         # ── Shared modules ────────────────────────────────────────────────
 
@@ -346,13 +371,17 @@ class VITRA_Paligemma(nn.Module):
         # Wrist → action head cross-attention modules
         if self.use_wrist_cam_train:
             self.missing_wrist_tokens.requires_grad_(True)
-            # Re-enable trainable input projection for depth channel.
+            # Re-enable trainable params for wrist encoding.
             # set_training_phase freezes all params first, so we must
-            # explicitly re-enable the encoder's input conv / patch embed.
+            # explicitly re-enable the appropriate modules.
             if self.wrist_encoder_type == "resnet34":
+                # Only conv1 (depth channel) is trainable
                 self.wrist_rgbd_encoder.conv1.requires_grad_(True)
             else:
-                self.wrist_rgbd_encoder.patch_embed.requires_grad_(True)
+                # DINOv2 stays frozen; depth CNN + fusion gate are trainable
+                self.wrist_depth_encoder.requires_grad_(True)
+                self.wrist_depth_gate.requires_grad_(True)
+                # DINOv2 backbone stays frozen (already frozen above)
             if hasattr(self, 'wrist_projector') and not isinstance(self.wrist_projector, nn.Identity):
                 self.wrist_projector.requires_grad_(True)
 
@@ -395,6 +424,12 @@ class VITRA_Paligemma(nn.Module):
     def _encode_wrist_for_action_head(self, wrist_rgbd):
         """Encode 4-ch RGBD wrist image into spatial tokens for DiT cross-attention.
 
+        For DINOv2 encoder: RGB is encoded by frozen DINOv2 ViT-B/14, depth
+        by a lightweight CNN. Features are combined via a learned gate:
+            fused = dino_rgb + gate * cnn_depth
+
+        For ResNet encoder: all 4 channels go through a single backbone.
+
         Args:
             wrist_rgbd: [B, 4, H, W] float32.
                         Channels: [R, G, B, depth_metres].
@@ -406,24 +441,33 @@ class VITRA_Paligemma(nn.Module):
         B = wrist_rgbd.shape[0]
 
         # Normalise RGB with ImageNet stats; normalise depth to ~[0,1]
-        rgb = wrist_rgbd[:, :3]   # [B, 3, H, W]
+        rgb = wrist_rgbd[:, :3]     # [B, 3, H, W]
         depth = wrist_rgbd[:, 3:4]  # [B, 1, H, W]
         rgb_norm = (rgb - self.wrist_rgb_mean) / self.wrist_rgb_std
         depth_norm = torch.clamp(depth, 0.0, 1.5) / 1.5
-        x = torch.cat([rgb_norm, depth_norm], dim=1)  # [B, 4, H, W]
 
-        # Forward through encoder backbone
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_bf16):
             if self.wrist_encoder_type == "resnet34":
-                # ResNet: forward_features → [B, C, H, W]
+                # ResNet: forward 4ch jointly → [B, C, H, W]
+                x = torch.cat([rgb_norm, depth_norm], dim=1)  # [B, 4, H, W]
                 feat_2d = self.wrist_rgbd_encoder.forward_features(x)
                 _B, C, H, W = feat_2d.shape
                 features = feat_2d.permute(0, 2, 3, 1).reshape(_B, H * W, C)
             else:
-                # ViT: forward_features → [B, N+prefix, D]
-                features = self.wrist_rgbd_encoder.forward_features(x)
-                num_prefix = getattr(self.wrist_rgbd_encoder, "num_prefix_tokens", 1)
-                features = features[:, num_prefix:]  # [B, N, D]
+                # ── DINOv2 (RGB) + Lightweight CNN (Depth) ───────────────
+                # 1) DINOv2: frozen forward on 3-ch RGB
+                rgb_features = self.wrist_rgb_encoder.forward_features(rgb_norm)
+                num_prefix = getattr(self.wrist_rgb_encoder, "num_prefix_tokens", 1)
+                rgb_features = rgb_features[:, num_prefix:]  # [B, N, D_dino]
+
+                # 2) Lightweight CNN: trainable forward on 1-ch depth
+                depth_2d = self.wrist_depth_encoder(depth_norm)  # [B, D_dino, G, G]
+                _B, D, dH, dW = depth_2d.shape
+                depth_features = depth_2d.permute(0, 2, 3, 1).reshape(_B, dH * dW, D)
+                # [B, N, D_dino]  (should match rgb_features shape)
+
+                # 3) Gated fusion: rgb + gate * depth
+                features = rgb_features + self.wrist_depth_gate * depth_features
 
         # Project to DiT hidden dim
         wrist_tokens = self.wrist_projector(features.float())  # [B, N_raw, D_hidden]
@@ -758,8 +802,11 @@ class VITRA_Paligemma(nn.Module):
                 image = Image.fromarray(image)
             else:
                 raise ValueError(f"Unsupported image shape: {image.shape}")
+        # Ensure RGB format — RGBA/P/L modes cause "Unable to infer channel dimension" in the processor
+        if isinstance(image, Image.Image) and image.mode != 'RGB':
+            image = image.convert('RGB')
         prefix = '<image>'
-        model_inputs = self.processor(text=prefix + instruction, images=image, return_tensors="pt").to('cuda')
+        model_inputs = self.processor(text=prefix + instruction, images=[image], return_tensors="pt").to('cuda')
         pixel_value = model_inputs['pixel_values']
         input_ids = model_inputs['input_ids']
 

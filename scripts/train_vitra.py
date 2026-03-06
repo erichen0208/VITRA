@@ -32,6 +32,11 @@ from vitra.datasets.grasp_dataset import (
 from vitra.models.vla_builder import load_model
 from vitra.utils.config_utils import load_config
 from vitra.utils.data_utils import PaddedCollatorForHandPrediction
+from vitra.utils.gripper_retarget import (
+    gripper_to_mano_action, gripper_to_mano_state,
+    gripper_to_mano_mask, gripper_to_mano_state_mask,
+    mano_action_to_gripper,
+)
 
 # ─── Robot registry (single source of truth) ─────────────────────────────
 _DC_DIR = os.path.join(os.path.dirname(__file__), "../../data_collection_maniskill")
@@ -96,6 +101,11 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
     data_cfg = configs.get("data", {})
     robot_name = eval_cfg.get("robot", "aloha_mini")
     rcfg = ROBOT_CONFIGS[robot_name]
+    retarget_cfg = configs.get("retarget", {})
+    use_retarget = retarget_cfg.get("enabled", False)
+    use_left = retarget_cfg.get("use_left", False)
+    mano_action_dim = retarget_cfg.get("mano_action_dim", 192)
+    mano_state_dim = retarget_cfg.get("mano_state_dim", 212)
 
     num_episodes = num_episodes or eval_cfg.get("num_episodes", 25)
     max_steps = eval_cfg.get("max_steps", 200)
@@ -133,7 +143,8 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
     use_wrist_rgbd = model.use_wrist_cam_train
 
     from mani_skill.envs.tasks.digital_twins.grasp.grasp_base_env import NUM_GRID_POSITIONS
-    N_GRID = NUM_GRID_POSITIONS  # 9 (3×3 grid)
+    # Random placement is now used for all episodes.
+    # NUM_GRID_POSITIONS is kept for backward compat but not used for grid lookup.
 
     n_objects = len(YCB_EVAL_OBJECTS)
     per_obj_success = [0] * n_objects
@@ -168,9 +179,8 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
 
         obj_successes = 0
         for ep in range(num_episodes):
-            grid_idx = ep % N_GRID
-            reset_opts = {"grid_positions_idx": [grid_idx]}
-            raw_obs, _ = env.reset(options=reset_opts)
+            # Random placement — no grid index needed
+            raw_obs, _ = env.reset()
             buf, buf_i = None, 0
             success = False
 
@@ -204,9 +214,21 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
                     #  if the raw value drifts slightly beyond the
                     #  training range — no separate OOD clamp needed)
                     s_norm = state_norm.normalize(state_7)
-                    s_t = torch.tensor(s_norm, dtype=torch.float32).unsqueeze(0).to(device)
-                    s_mask = torch.ones(1, STATE_DIM, dtype=torch.float32, device=device)
-                    a_mask = torch.ones(1, chunk_size, ACTION_DIM, dtype=torch.float32, device=device)
+
+                    # Retarget 7-dim → MANO format if enabled
+                    if use_retarget:
+                        s_mano = gripper_to_mano_state(
+                            torch.tensor(s_norm, dtype=torch.float32), use_left=use_left
+                        )
+                        s_t = s_mano.unsqueeze(0).to(device)
+                        s_mask_7 = torch.ones(1, STATE_DIM, dtype=torch.float32, device=device)
+                        s_mask = gripper_to_mano_state_mask(s_mask_7, use_left=use_left).to(device)
+                        a_mask_7 = torch.ones(1, chunk_size, ACTION_DIM, dtype=torch.float32, device=device)
+                        a_mask = gripper_to_mano_mask(a_mask_7, use_left=use_left).to(device)
+                    else:
+                        s_t = torch.tensor(s_norm, dtype=torch.float32).unsqueeze(0).to(device)
+                        s_mask = torch.ones(1, STATE_DIM, dtype=torch.float32, device=device)
+                        a_mask = torch.ones(1, chunk_size, ACTION_DIM, dtype=torch.float32, device=device)
 
                     # Predict
                     pred = model.predict_action(
@@ -220,12 +242,14 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
                     )
 
                     # Denormalise with ActionNormalizer
-                    # No task-specific gripper clamping — the model
-                    # should learn when to open/close from data.
-                    # symmetric_minmax places "no movement" at norm 0.0
-                    # (the diffusion prior centre), so the model
-                    # naturally defaults to "stay still" when uncertain.
-                    chunk = action_norm.denormalize(pred[0])  # [T, 7]
+                    # If retargeting, first convert MANO 192-dim → 7-dim gripper,
+                    # then denormalize
+                    if use_retarget:
+                        pred_mano = pred[0]  # [T, 192]
+                        pred_7d = mano_action_to_gripper(pred_mano, use_left=use_left)  # [T, 7]
+                        chunk = action_norm.denormalize(pred_7d)
+                    else:
+                        chunk = action_norm.denormalize(pred[0])  # [T, 7]
                     buf, buf_i = chunk, 1
                     ee_action = chunk[0]
 
@@ -258,7 +282,7 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
         "seen_pct": round(seen_rate, 1),
         "unseen_pct": round(unseen_rate, 1),
         "num_episodes_per_object": num_episodes,
-        "grid_positions": N_GRID,
+        "placement": "random",
         "per_object": {
             obj_id: {
                 "split": "seen" if i in YCB_EVAL_SEEN_IDX else "unseen",
@@ -287,14 +311,39 @@ class GraspTrainDataset(Dataset):
 
     Handles:
       - Normalisation of state/action (Gaussian, 7-dim)
+      - Retargeting: 7-dim gripper → 192/212-dim MANO format
       - Head camera RGB → PaliGemma processor input
       - Wrist camera RGBD → 4-channel [B, 4, H, W] tensor
+      - Image augmentation (color jitter) for training robustness
     """
 
-    def __init__(self, core: GraspDatasetCore, processor, camera_fov_rad=1.6):
+    def __init__(self, core: GraspDatasetCore, processor, camera_fov_rad=1.6,
+                 augment=True, head_jitter_cfg=None, wrist_jitter_cfg=None,
+                 use_retarget=False, use_left=False):
         self.core = core
         self.processor = processor
         self.camera_fov_rad = camera_fov_rad
+        self.augment = augment
+        self.use_retarget = use_retarget
+        self.use_left = use_left
+
+        if augment:
+            from torchvision.transforms import ColorJitter
+            hc = head_jitter_cfg or {}
+            wc = wrist_jitter_cfg or {}
+            self.head_jitter = ColorJitter(
+                brightness=hc.get("brightness", 0.3),
+                contrast=hc.get("contrast", 0.3),
+                saturation=hc.get("saturation", 0.2),
+                hue=hc.get("hue", 0.05),
+            )
+            self.wrist_jitter = ColorJitter(
+                brightness=wc.get("brightness", 0.2),
+                contrast=wc.get("contrast", 0.2),
+                saturation=wc.get("saturation", 0.1),
+                hue=wc.get("hue", 0.03),
+            )
+            print(f"Augmentation ON: head_jitter={hc}, wrist_jitter={wc}")
 
     def __len__(self):
         return len(self.core)
@@ -307,24 +356,41 @@ class GraspTrainDataset(Dataset):
     def _to_collator_format(self, data):
         # ── Head camera → VLM input ──────────────────────────────────────
         head_img = Image.fromarray(data["head_rgb"])
+        if self.augment:
+            head_img = self.head_jitter(head_img)
         text = "<image>" + data["instruction"]
         inputs = self.processor(text=text, images=[head_img], return_tensors="pt").to(torch.float32)
+
+        # ── Retarget 7-dim → MANO format if enabled ─────────────────────
+        actions = data["action_list"]       # [T, 7] torch
+        action_masks = data["action_mask"]  # [T, 7] torch
+        state = data["current_state"]       # [7] torch
+        state_mask = data["current_state_mask"]  # [7] torch
+
+        if self.use_retarget:
+            actions = gripper_to_mano_action(actions, use_left=self.use_left)         # [T, 192]
+            action_masks = gripper_to_mano_mask(action_masks, use_left=self.use_left) # [T, 192]
+            state = gripper_to_mano_state(state, use_left=self.use_left)              # [212]
+            state_mask = gripper_to_mano_state_mask(state_mask, use_left=self.use_left)  # [212]
 
         out = dict(
             pixel_values=inputs["pixel_values"],
             input_ids=inputs["input_ids"].squeeze(0),
             labels=None,
             dataset_name="grasp",
-            actions=data["action_list"],               # [T, 7]
-            action_masks=data["action_mask"],           # [T, 7]
-            current_state_mask=data["current_state_mask"],  # [7]
-            current_state=data["current_state"],        # [7]
+            actions=actions,
+            action_masks=action_masks,
+            current_state_mask=state_mask,
+            current_state=state,
             fov=torch.tensor([self.camera_fov_rad, self.camera_fov_rad], dtype=torch.float32),
         )
 
         # ── Wrist camera RGBD → 4-channel tensor ────────────────────────
         wrist_rgb = data["wrist_rgb"]      # [H, W, 3] uint8
         wrist_depth = data["wrist_depth"]  # [H, W] float32 metres
+        if self.augment:
+            wrist_pil = Image.fromarray(wrist_rgb)
+            wrist_rgb = np.array(self.wrist_jitter(wrist_pil))
 
         # Convert to float [0, 1] and stack
         rgb_t = torch.from_numpy(wrist_rgb).float().permute(2, 0, 1) / 255.0  # [3, H, W]
@@ -341,49 +407,53 @@ class GraspTrainDataset(Dataset):
 def make_optimizer(model, t_cfg):
     """Create AdamW with 3 parameter groups for fine-grained LR control.
 
-    Group 1 – Pretrained DiT blocks (self-attn, FFN, adaLN, cross-attn):
+    Group 1 – Pretrained DiT (all layers including I/O that match pretrained
+              shapes with 192-dim action head via retargeting):
               Slower LR to preserve pretrained features.
-    Group 2 – New I/O layers (ActionEmbedder, StateEmbedder, FinalLayer,
-              wrist_projector, missing_wrist_tokens, cognition_token, fov_encoder,
-              TimestepEmbedder, LabelEmbedder, positional_embedding):
-              Higher LR since they're randomly initialised.
+    Group 2 – New modules (wrist encoder/projector, cognition_token, fov_encoder,
+              missing_wrist_tokens, wrist cross-attention layers):
+              Higher LR since they're newly initialised.
     Group 3 – LoRA adapters + multi_modal_projector (P_g):
               Moderate LR for adapting the VLM to the robot domain.
     """
     from vitra.utils.lora import lora_params as _lora_params
 
-    # Collect param IDs per group
-    # --- Group 2: new I/O layers in the action model ---
-    new_io_names = {
-        "x_embedder", "state_embedder", "final_layer",
-        "t_embedder", "z_embedder", "positional_embedding",
-    }
-    new_io_ids = set()
-    dit = model.act_model.net  # the DiT module
-    for name, param in dit.named_parameters():
-        top = name.split(".")[0]
-        if top in new_io_names or name == "positional_embedding":
-            new_io_ids.add(id(param))
+    # --- Group 2: new modules (wrist, cognition, fov) ---
+    new_module_ids = set()
 
-    # Wrist modules + cognition token + fov_encoder → also new I/O
-    for attr in ("wrist_projector", "missing_wrist_tokens", "cognition_token", "fov_encoder"):
+    # Wrist modules (wrist_rgb_encoder is frozen DINOv2, included for completeness)
+    for attr in ("wrist_projector", "missing_wrist_tokens", "wrist_rgbd_encoder",
+                 "wrist_rgb_encoder", "wrist_depth_encoder", "wrist_depth_gate"):
         obj = getattr(model, attr, None)
         if obj is None:
             continue
         if isinstance(obj, nn.Parameter):
-            new_io_ids.add(id(obj))
+            new_module_ids.add(id(obj))
         elif isinstance(obj, nn.Module):
             for p in obj.parameters():
-                new_io_ids.add(id(p))
+                new_module_ids.add(id(p))
 
-    # Wrist encoder input projection (trainable part of frozen backbone)
-    if hasattr(model, "wrist_rgbd_encoder"):
-        if getattr(model, "wrist_encoder_type", None) == "resnet34":
-            input_proj = model.wrist_rgbd_encoder.conv1
-        else:
-            input_proj = model.wrist_rgbd_encoder.patch_embed
-        for p in input_proj.parameters():
-            new_io_ids.add(id(p))
+    # Cognition token + fov encoder
+    for attr in ("cognition_token", "fov_encoder"):
+        obj = getattr(model, attr, None)
+        if obj is None:
+            continue
+        if isinstance(obj, nn.Parameter):
+            new_module_ids.add(id(obj))
+        elif isinstance(obj, nn.Module):
+            for p in obj.parameters():
+                new_module_ids.add(id(p))
+
+    # Cross-attention modules in DiT blocks (new for robot finetuning)
+    dit = model.act_model.net
+    for block in dit.blocks:
+        if block.use_wrist_cross_attn:
+            for p in block.cross_attn.parameters():
+                new_module_ids.add(id(p))
+            for p in block.norm_cross.parameters():
+                new_module_ids.add(id(p))
+            for p in block.adaLN_cross.parameters():
+                new_module_ids.add(id(p))
 
     # --- Group 3: LoRA + P_g ---
     lora_pg_ids = set()
@@ -393,38 +463,38 @@ def make_optimizer(model, t_cfg):
         for p in model.model.multi_modal_projector.parameters():
             lora_pg_ids.add(id(p))
 
-    # --- Group 1: pretrained DiT blocks (everything in act_model not in new_io) ---
-    dit_block_ids = set()
+    # --- Group 1: pretrained DiT (everything in act_model not in new_modules) ---
+    dit_pretrained_ids = set()
     for p in model.act_model.parameters():
         pid = id(p)
-        if pid not in new_io_ids:
-            dit_block_ids.add(pid)
+        if pid not in new_module_ids:
+            dit_pretrained_ids.add(pid)
 
     # Build groups from trainable params only
-    g_dit, g_io, g_lora, g_other = [], [], [], []
+    g_dit, g_new, g_lora, g_other = [], [], [], []
     for p in model.parameters():
         if not p.requires_grad:
             continue
         pid = id(p)
-        if pid in new_io_ids:
-            g_io.append(p)
+        if pid in new_module_ids:
+            g_new.append(p)
         elif pid in lora_pg_ids:
             g_lora.append(p)
-        elif pid in dit_block_ids:
+        elif pid in dit_pretrained_ids:
             g_dit.append(p)
         else:
             g_other.append(p)
 
     lr_dit  = t_cfg.get("lr_dit_blocks", 5e-5)
-    lr_io   = t_cfg.get("lr_new_io", 2e-4)
+    lr_new  = t_cfg.get("lr_new_io", 2e-4)
     lr_lora = t_cfg.get("lr_lora_pg", 1e-4)
     lr_base = t_cfg.get("learning_rate", 1e-4)
 
     groups = []
     if g_dit:
-        groups.append({"params": g_dit,   "lr": lr_dit,  "name": "dit_blocks"})
-    if g_io:
-        groups.append({"params": g_io,    "lr": lr_io,   "name": "new_io"})
+        groups.append({"params": g_dit,   "lr": lr_dit,  "name": "dit_pretrained"})
+    if g_new:
+        groups.append({"params": g_new,   "lr": lr_new,  "name": "new_modules"})
     if g_lora:
         groups.append({"params": g_lora,  "lr": lr_lora, "name": "lora_pg"})
     if g_other:
@@ -517,9 +587,18 @@ def train(args):
         stats_path=stats_path,
     )
 
+    aug_cfg = configs.get("augmentation", {})
+    retarget_cfg = configs.get("retarget", {})
+    use_retarget = retarget_cfg.get("enabled", False)
+    use_left = retarget_cfg.get("use_left", False)
     dataset = GraspTrainDataset(
         core, model.processor,
         camera_fov_rad=data_cfg.get("camera_fov_rad", 1.6),
+        augment=aug_cfg.get("enabled", True),
+        head_jitter_cfg=aug_cfg.get("head_color_jitter"),
+        wrist_jitter_cfg=aug_cfg.get("wrist_color_jitter"),
+        use_retarget=use_retarget,
+        use_left=use_left,
     )
     collator = PaddedCollatorForHandPrediction(
         model.processor.tokenizer.model_max_length,

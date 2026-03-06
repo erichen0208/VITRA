@@ -12,9 +12,9 @@
 
     "model_load_path": "VITRA-VLA/VITRA-VLA-3B",
 
-    "action_dim": 7,
-    "state_dim": 7,
-    "loss_type": "robot_7d",
+    "action_dim": 192,
+    "state_dim": 212,
+    "loss_type": "robot",
 
     "vlm": {
         "type": "PaliGemmaForConditionalGeneration",
@@ -25,25 +25,34 @@
     "action_model": {
         "model_type": "DiT-B",
         "token_size": 2304,
-        "action_dim": 7,
+        "action_dim": 192,
         "use_state": true,
         "use_wrist_cross_attn": true
     },
 
     "state_encoder": {
-        "state_dim": 7,
+        "state_dim": 212,
         "state_key": "current_state",
         "state_mask_key": "current_state_mask"
     },
 
     "wrist_cam": {
-        "encoder": "resnet34",
+        "encoder": "dinov2_vitb14",
+        "depth_encoder": "lightweight_cnn",
         "in_channels": 4,
         "image_size": 224,
         "freeze_backbone": true,
         "output_dim": 768,
         "mask_prob": 0.2,
-        "pool_size": 7
+        "pool_size": 8
+    },
+
+    "retarget": {
+        "enabled": true,
+        "use_left": false,
+        "gripper_dim": 7,
+        "mano_action_dim": 192,
+        "mano_state_dim": 212
     },
 
     "train_setup": {
@@ -51,14 +60,14 @@
     },
 
     "lora": {
-        "target_modules": ["q_proj", "v_proj"],
-        "rank": 16,
-        "alpha": 32
+        "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+        "rank": 64,
+        "alpha": 128
     },
 
     "training_phases": {
         "phase1_steps": 3000,
-        "phase2_steps": 18000
+        "phase2_steps": 27000
     },
 
     "trainer": {
@@ -69,12 +78,28 @@
         "weight_decay": 0.01,
         "gradient_clip_val": 1.0,
         "warmup_steps": 200,
-        "max_steps": 21000,
-        "save_every": 3000,
+        "max_steps": 30000,
+        "save_every": 5000,
         "log_every": 100,
-        "eval_every": 3000,
-        "eval_episodes": 1,
+        "eval_every": 5000,
+        "eval_episodes": 3,
         "grad_accum": 4
+    },
+
+    "augmentation": {
+        "enabled": true,
+        "head_color_jitter": {
+            "brightness": 0.3,
+            "contrast": 0.3,
+            "saturation": 0.2,
+            "hue": 0.05
+        },
+        "wrist_color_jitter": {
+            "brightness": 0.2,
+            "contrast": 0.2,
+            "saturation": 0.1,
+            "hue": 0.03
+        }
     },
 
     "train_dataset": {
@@ -93,11 +118,11 @@
         "robot": "aloha_mini",
         "num_episodes": 9,
         "max_steps": 200,
-        "execute_steps": 2,
+        "execute_steps": 8,
         "gripper_scale": 1.0,
         "rotation_weight": 0.3,
         "ik_damping": 0.05,
         "ddim_steps": 10,
-        "cfg_scale": 2.0
+        "cfg_scale": 1.5
     }
 }

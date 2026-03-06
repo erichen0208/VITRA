@@ -704,6 +704,9 @@ class VLAInferenceService:
             # Return unnormalized action as numpy array
             return result['data']
         else:
+            tb = result.get('traceback', '')
+            if tb:
+                print(f"[VLA Process traceback]:\n{tb}")
             raise RuntimeError(f"VLA inference failed: {result.get('error', 'Unknown error')}")
     
     def shutdown(self):

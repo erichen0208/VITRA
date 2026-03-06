@@ -194,4 +194,5 @@ benchmark*/
 .DS_Store
 
 examples/custom
+examples/distance
 checkpoints/
