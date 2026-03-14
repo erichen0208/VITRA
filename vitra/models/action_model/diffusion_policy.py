@@ -109,7 +109,12 @@ class DiffusionPolicy(nn.Module):
         
         for name, (start, end, weight) in self.loss_components.items():
             component_losses[name] = mask_loss(start, end) * weight
-            component_counts[name] = x_mask[:, :, start].sum()
+            # Count samples where ANY dim in the component range is active.
+            # Using x_mask[:, :, start].sum() only checks the first dim, which
+            # breaks when sparse retarget masks leave the first dim inactive
+            # (e.g. right_hand_joints starts at dim 57 but gripper retarget
+            # activates dims 59, 68, 77, 86).
+            component_counts[name] = x_mask[:, :, start:end].any(dim=-1).float().sum()
         
         total_count = sum(component_counts.values())
 

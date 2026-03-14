@@ -162,6 +162,13 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
             robot_uids=rcfg["robot_uid"], control_mode=rcfg["control_mode"],
             frozen_joint_indices=rcfg["frozen_joint_indices"],
             exclude_cameras=exclude_cams,
+            # Tighten physics for reliable grasping:
+            #   solver_position_iterations 25 (default 15) — stable grasps
+            #   enable_ccd: continuous collision detection prevents tunneling
+            sim_config=dict(scene_config=dict(
+                solver_position_iterations=25,
+                enable_ccd=True,
+            )),
         )
         env.reset(seed=seed)
 
@@ -243,15 +250,32 @@ def run_eval(model, stats, configs, record_dir=None, num_episodes=None, seed=1):
 
                     # Denormalise with ActionNormalizer
                     # If retargeting, first convert MANO 192-dim → 7-dim gripper,
-                    # then denormalize
+                    # then denormalize.  mano_action_to_gripper already clamps
+                    # gripper to [CLOSE, OPEN] in normalised space; the raw-space
+                    # clamp below is a safety net.
                     if use_retarget:
                         pred_mano = pred[0]  # [T, 192]
                         pred_7d = mano_action_to_gripper(pred_mano, use_left=use_left)  # [T, 7]
                         chunk = action_norm.denormalize(pred_7d)
                     else:
                         chunk = action_norm.denormalize(pred[0])  # [T, 7]
+                    # Clamp gripper to physical range (dim 6)
+                    if isinstance(chunk, np.ndarray):
+                        chunk[:, 6] = np.clip(chunk[:, 6], -1.1, 0.0)
+                    else:
+                        chunk[:, 6] = chunk[:, 6].clamp(-1.1, 0.0)
                     buf, buf_i = chunk, 1
                     ee_action = chunk[0]
+
+                # ── Gripper: absolute target qpos → delta ──────────
+                # The model predicts absolute gripper target qpos
+                # (from the training data where dim 6 = gripper_pos_after).
+                # The IK controller expects a delta.  Convert here so the
+                # PD controller drives the gripper at the correct speed
+                # instead of always clipping to max velocity.
+                cur_grip = float(env.unwrapped.agent.robot.get_qpos()[0, ik.gripper_qidx])
+                ee_action = ee_action.copy() if isinstance(ee_action, np.ndarray) else ee_action.clone()
+                ee_action[6] = ee_action[6] - cur_grip
 
                 # Apply EE delta via IK controller (NR IK + PD gripper)
                 act_t = ik.step(ee_action, env, env_idx=0)
@@ -615,7 +639,9 @@ def train(args):
     phase1_steps = phase_boundaries[1][1] if len(phase_boundaries) > 1 else max_steps
     scheduler = make_scheduler(optimizer, warmup, phase1_steps)
     grad_accum = t_cfg.get("grad_accum", 4)
-    scaler = torch.amp.GradScaler("cuda", enabled=configs.get("use_bf16", False))
+    # GradScaler only needed for fp16 (bf16 has same exponent range as fp32)
+    use_fp16 = configs.get("use_fp16", False)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     save_every = t_cfg.get("save_every", 1000)
     log_every = t_cfg.get("log_every", 50)
@@ -664,7 +690,7 @@ def train(args):
                         model.set_training_phase(phase_name)
                         optimizer = make_optimizer(model, t_cfg)
                         scheduler = make_scheduler(optimizer, warmup, max_steps - step)
-                        scaler = torch.amp.GradScaler("cuda", enabled=configs.get("use_bf16", False))
+                        scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
                         break
 
                 if step % log_every == 0:

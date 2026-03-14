@@ -304,20 +304,25 @@ class GraspDatasetCore:
         # Image root paths
         self.data_dir_path = Path(data_dir)
 
-        # Load task descriptions from meta/tasks.json (task_index → string)
-        tasks_path = os.path.join(data_dir, "meta", "tasks.json")
+        # Load task descriptions from meta/tasks.json or meta/tasks.parquet
         self._tasks = {}
-        if os.path.exists(tasks_path):
+        tasks_json = os.path.join(data_dir, "meta", "tasks.json")
+        tasks_parquet = os.path.join(data_dir, "meta", "tasks.parquet")
+        if os.path.exists(tasks_json):
             import json as _json
-            with open(tasks_path) as f:
+            with open(tasks_json) as f:
                 tasks_list = _json.load(f)
-            # tasks.json is a list of {task_index: int, task: str}
             if isinstance(tasks_list, list):
                 for entry in tasks_list:
                     self._tasks[entry["task_index"]] = entry["task"]
             elif isinstance(tasks_list, dict):
                 for k, v in tasks_list.items():
                     self._tasks[int(k)] = v
+        elif os.path.exists(tasks_parquet):
+            # LeRobot v3 format: parquet with task string as index, task_index as column
+            tasks_df = pd.read_parquet(tasks_parquet)
+            for task_str, row in tasks_df.iterrows():
+                self._tasks[int(row["task_index"])] = str(task_str)
 
         # Valid sample indices: every frame that has at least 1 future frame
         self._valid_indices = []

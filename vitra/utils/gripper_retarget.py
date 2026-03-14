@@ -30,13 +30,13 @@ Hardware / display constants (Aloha Mini + MANO visual config):
   MANO_REST_HAND_POSE    — 45-dim thumb rest shape (jaw-like spread)
 
 Gripper ↔ MANO curl normalization:
-  GRIPPER_QPOS_OPEN   = 0.0  rad — fully open
-  GRIPPER_QPOS_CLOSE  = -1.1 rad — fully closed
-  MANO_MCP_FULL_CURL  = 1.5  rad — MCP-z that makes fingers touch the thumb
+  GRIPPER_QPOS_OPEN   = 0.0  — normalised open  (symmetric_minmax preserves 0)
+  GRIPPER_QPOS_CLOSE  = -1.0 — normalised closed (symmetric_minmax maps min → -1)
+  MANO_MCP_FULL_CURL  = 2.0  rad — MCP-z that makes fingers touch the thumb
 
-  Linear mapping (display helpers only; training helpers are unchanged):
-    qpos = 0.0  → MCP-z = 0.0                (fingers straight)
-    qpos = -1.1 → MCP-z = MANO_MCP_FULL_CURL (fingers touch thumb)
+  Linear mapping (training retarget + display helpers):
+    norm grip =  0.0  → MCP-z = 0.0                (fingers straight)
+    norm grip = -1.0  → MCP-z = MANO_MCP_FULL_CURL (fingers touch thumb)
 
 High-level display helpers:
   gripper_euler_to_mano_euler(wrist_euler) → strips yaw
@@ -115,17 +115,23 @@ def gripper_to_mano_action(gripper_action, use_left=False):
     out[..., rot_slice] = gripper_action[..., 3:6]
 
     # Gripper → four-finger MCP joints
-    # The gripper scalar drives the z-component (flexion/extension) of each
-    # MCP Euler angle.  In MANO xyz Euler convention:
-    #   x = abduction, y = twist, z = flexion (curl).
-    # This matches the XHand→Human mapping in robot_dataset.py which also
-    # uses the z-component for PIP/DIP curl.
+    # Scale normalised gripper [OPEN=0, CLOSE=-1] → MCP flex [0, FULL_CURL=+2].
+    # Linear map:  t = (grip - OPEN) / (CLOSE - OPEN)   ∈ [0, 1]
+    #              flex = t * MANO_MCP_FULL_CURL          ∈ [0, 2]
+    # Clamp t to [0, 1] so flex stays in the valid range even if the input
+    # is slightly out-of-bounds (numerical noise or OOD samples).
     grip_val = gripper_action[..., 6:7]  # [..., 1]
+    t = (grip_val - GRIPPER_QPOS_OPEN) / (GRIPPER_QPOS_CLOSE - GRIPPER_QPOS_OPEN)
+    if is_tensor:
+        t = t.clamp(0.0, 1.0)
+    else:
+        t = np.clip(t, 0.0, 1.0)
+    flex = t * MANO_MCP_FULL_CURL  # [..., 1]
 
     joints_start = joints_slice.start
     for mcp in FOUR_FINGER_MCP_SLICES:
         # Set the z-component (flexion) of each MCP
-        out[..., joints_start + mcp.start + MCP_FLEX_OFFSET] = grip_val[..., 0]
+        out[..., joints_start + mcp.start + MCP_FLEX_OFFSET] = flex[..., 0]
 
     return out
 
@@ -192,20 +198,26 @@ def mano_action_to_gripper(mano_action, use_left=False):
     out[..., :3] = mano_action[..., trans_slice]
     out[..., 3:6] = mano_action[..., rot_slice]
 
-    # Average four MCP flexion values (z-component) → gripper scalar
+    # Average four MCP flexion values (z-component), then scale back
+    # to normalised gripper space:
+    #   t = clamp(flex / MANO_MCP_FULL_CURL, 0, 1)
+    #   grip = OPEN + t * (CLOSE - OPEN)   ∈ [-1, 0]
     joints_start = joints_slice.start
     if is_tensor:
         mcp_vals = torch.stack([
             mano_action[..., joints_start + mcp.start + MCP_FLEX_OFFSET]
             for mcp in FOUR_FINGER_MCP_SLICES
         ], dim=-1)
-        out[..., 6] = mcp_vals.mean(dim=-1)
+        avg_flex = mcp_vals.mean(dim=-1)
+        t = (avg_flex / MANO_MCP_FULL_CURL).clamp(0.0, 1.0)
     else:
         mcp_vals = np.stack([
             mano_action[..., joints_start + mcp.start + MCP_FLEX_OFFSET]
             for mcp in FOUR_FINGER_MCP_SLICES
         ], axis=-1)
-        out[..., 6] = mcp_vals.mean(axis=-1)
+        avg_flex = mcp_vals.mean(axis=-1)
+        t = np.clip(avg_flex / MANO_MCP_FULL_CURL, 0.0, 1.0)
+    out[..., 6] = GRIPPER_QPOS_OPEN + t * (GRIPPER_QPOS_CLOSE - GRIPPER_QPOS_OPEN)
 
     return out
 
@@ -326,13 +338,31 @@ for i in [2, 11, 20, 29]:
 
 
 # ── Gripper ↔ MANO curl normalization ────────────────────────────────────────
-# Maps the physical gripper range linearly to the MANO MCP flexion range.
-# These values are used ONLY by the display helpers below; the training-level
-# functions (gripper_to_mano_action / mano_action_to_gripper) are unchanged.
-GRIPPER_QPOS_OPEN  = 0.0    # rad — fully open
-GRIPPER_QPOS_CLOSE = -1.1   # rad — fully closed
+# Maps the gripper range linearly to the MANO MCP flexion range.
+# Used by BOTH training-level retarget and display helpers.
+#
+# After ActionNormalizer symmetric_minmax, the normalized gripper lives in
+# [-1, 0] where 0 = open, -1 = fully closed.  The retarget functions scale
+# this to MANO MCP flex [0, MANO_MCP_FULL_CURL] (0 = straight, positive =
+# curled) so the action head sees the same sign convention as the pretrained
+# human-hand data.
+GRIPPER_QPOS_OPEN  = 0.0    # normalised open  (unchanged by symmetric_minmax)
+GRIPPER_QPOS_CLOSE = -1.0   # normalised closed (symmetric_minmax maps min → -1)
 MANO_MCP_FULL_CURL = 2.0    # rad — MCP-z that makes finger tips touch the thumb
                              #        (tune this constant if the closure looks off)
+
+# ── World → MANO camera frame rotation ────────────────────────────────────────
+# Maps a vector in robot world frame (+X fwd, +Y left, +Z up) to the MANO
+# rendering camera frame (OpenCV convention: +X right, +Y down, +Z depth).
+#   world +X (fwd)  → MANO +Z:   col-Z of M = world +X
+#   world +Y (left) → MANO -X:   col-X of M = -world +Y  → M[0,:] = [0,-1,0]
+#   world +Z (up)   → MANO -Y:   col-Y of M = -world +Z  → M[1,:] = [0,0,-1]
+# M is a proper rotation (det=1, verified).
+R_WORLD_TO_MANO_CAM = np.array(
+    [[ 0., -1.,  0.],   # MANO x = -world y
+     [ 0.,  0., -1.],   # MANO y = -world z
+     [ 1.,  0.,  0.]],  # MANO z =  world x
+    dtype=np.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -375,12 +405,40 @@ def mano_wrist_rotation(wrist_euler):
     return _SciRot.from_euler('zxy', eu_mano).as_matrix().astype(np.float32)
 
 
+def tcp_rot_to_mano_orient(R_tcp_world, R_tcp_rest_world):
+    """Convert actual TCP world-frame rotation to MANO global_orient matrix.
+
+    Uses the full 6-DOF TCP rotation read back from the simulator (not just the
+    commanded Euler angles), giving an exact retarget for every FORWARD / LATERAL
+    / ROLL / FLEX motion where IK produces a non-trivial wrist rotation.
+
+    Derivation:
+        1. Compute the delta rotation from rest in world frame:
+               R_delta = R_tcp_world @ R_tcp_rest_world.T
+        2. Express that delta in MANO camera frame:
+               R_go = M @ R_delta @ M.T @ MANO_REST_R
+           where M = R_WORLD_TO_MANO_CAM  maps world axes → MANO camera axes.
+        3. MANO_REST_R is pre-multiplied so that R_delta = I gives the
+           resting hand appearance.
+
+    Args:
+        R_tcp_world:      (3,3) float — actual TCP rotation in world frame.
+        R_tcp_rest_world: (3,3) float — TCP rotation at the rest/neutral pose.
+
+    Returns:
+        ndarray (3,3) float32 — MANO global_orient rotation matrix.
+    """
+    M = R_WORLD_TO_MANO_CAM
+    R_delta = np.asarray(R_tcp_world,      dtype=np.float32) @ \
+              np.asarray(R_tcp_rest_world, dtype=np.float32).T
+    return (M @ R_delta @ M.T @ MANO_REST_R).astype(np.float32)
+
+
 def gripper_to_mano_display(gripper_qpos, wrist_euler):
     """Convert a gripper command to MANO display representation.
 
-    Normalises the gripper range to the MANO MCP flexion range:
-        qpos = GRIPPER_QPOS_OPEN  (0.0)  → MCP-z = 0.0                (straight)
-        qpos = GRIPPER_QPOS_CLOSE (-1.1) → MCP-z = MANO_MCP_FULL_CURL (touch thumb)
+    Takes RAW gripper qpos (0 = open, -1.1 = closed) and maps to MANO.
+    Internally normalises to [-1, 0] before using the training-level retarget.
 
     Args:
         gripper_qpos: float — Aloha convention: 0 = open, negative = closed.
@@ -392,11 +450,12 @@ def gripper_to_mano_display(gripper_qpos, wrist_euler):
         eu_display: ndarray (3,) float32 — [roll, flex, 0], yaw stripped.
     """
     eu = gripper_euler_to_mano_euler(wrist_euler)
-    # Normalise: map [OPEN, CLOSE] → [0, MANO_MCP_FULL_CURL]
-    t = np.clip(-float(gripper_qpos) / abs(GRIPPER_QPOS_CLOSE), 0.0, 1.0)
+    # Map raw qpos [0, -1.1] → normalised [0, -1] for the training retarget
+    RAW_CLOSE = -1.1  # physical limit, not the normalised constant
+    norm_grip = np.clip(float(gripper_qpos) / abs(RAW_CLOSE), -1.0, 0.0)
     g7 = np.zeros(7, np.float32)
     g7[3:6] = eu
-    g7[6] = t * MANO_MCP_FULL_CURL
+    g7[6] = norm_grip
     m = gripper_to_mano_action(g7)
     return m[RIGHT_JOINTS].copy(), eu
 
@@ -405,15 +464,15 @@ def mano_to_gripper_display(mcp_val, wrist_euler):
     """Convert MANO MCP flexion value to a gripper command for display.
 
     Inverse of gripper_to_mano_display normalisation:
-        mcp_val = 0.0                → qpos = GRIPPER_QPOS_OPEN  (0.0)
-        mcp_val = MANO_MCP_FULL_CURL → qpos = GRIPPER_QPOS_CLOSE (-1.1)
+        mcp_val = 0.0                → qpos = 0.0   (open)
+        mcp_val = MANO_MCP_FULL_CURL → qpos = -1.1  (closed)
 
     Args:
         mcp_val:     float — MANO convention: 0 = straight, positive = curl in.
         wrist_euler: array-like [roll, flex, yaw].
 
     Returns:
-        gripper_qpos: float — Aloha convention (0 = open, negative = closed).
+        gripper_qpos: float — Aloha raw qpos (0 = open, negative = closed).
         eu_display:   ndarray (3,) float32 — [roll, flex, 0].
         hp45:         ndarray (45,) float32 — raw MANO joint angles.
     """
@@ -424,7 +483,8 @@ def mano_to_gripper_display(mcp_val, wrist_euler):
     for mcp in FOUR_FINGER_MCP_SLICES:
         m[RIGHT_JOINTS.start + mcp.start + MCP_FLEX_OFFSET] = float(mcp_val)
     hp45 = m[RIGHT_JOINTS].copy()
-    # Inverse normalise: [0, MANO_MCP_FULL_CURL] → [OPEN, CLOSE]
+    # Inverse normalise: [0, MANO_MCP_FULL_CURL] → raw qpos [0, -1.1]
+    RAW_CLOSE = -1.1  # physical limit
     t = np.clip(float(mcp_val) / MANO_MCP_FULL_CURL, 0.0, 1.0)
-    gripper_qpos = t * GRIPPER_QPOS_CLOSE   # negative when closed
+    gripper_qpos = t * RAW_CLOSE
     return gripper_qpos, eu, hp45
