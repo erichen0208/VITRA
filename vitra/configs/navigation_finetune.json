@@ -1,0 +1,89 @@
+{
+  "vla_name": "VITRA_Paligemma",
+  "task_name": "NavigationTrain",
+  "fwd_pred_next_n": 16,
+  "seed": 42,
+  "batch_size": 4,
+  "use_bf16": true,
+  "use_fov": true,
+  "untied_cognition_token": true,
+  "use_state": null,
+  "repeated_diffusion_steps": 1,
+
+  "model_load_path": "VITRA-VLA/VITRA-VLA-3B",
+
+  "loss_type": "navigation",
+
+  "vlm": {
+    "type": "PaliGemmaForConditionalGeneration",
+    "name": "paligemma",
+    "pretrained_model_name_or_path": "google/paligemma2-3b-mix-224"
+  },
+
+  "action_model": {
+    "model_type": "DiT-S",
+    "token_size": 2304,
+    "action_dim": 4,
+    "use_wrist_cross_attn": false,
+    "navigation_tail_boost": 0.25,
+    "navigation_straight_alpha": 0.6,
+    "navigation_straight_decay_deg": 12.0
+  },
+
+  "state_encoder": {
+    "state_dim": 4,
+    "state_key": "current_state",
+    "state_mask_key": "current_state_mask"
+  },
+
+  "train_setup": {
+    "freeze_option": "freeze_vision_encoder"
+  },
+
+  "lora_training": {
+    "enabled": false,
+    "freeze_steps": 3000,
+    "warmup_steps": 200
+  },
+
+  "trainer": {
+    "learning_rate": 1e-4,
+    "lr_action_head": 2e-4,
+    "lr_lora_pg": 1e-4,
+    "weight_decay": 0.01,
+    "gradient_clip_val": 1.0,
+    "warmup_steps": 200,
+    "max_steps": 18000,
+    "save_every": 9000,
+    "log_every": 100,
+    "grad_accum": 4
+  },
+
+  "augmentation": {
+    "enabled": true,
+    "head_color_jitter": {
+      "brightness": 0.2,
+      "contrast": 0.2,
+      "saturation": 0.1,
+      "hue": 0.03
+    }
+  },
+
+  "train_dataset": {
+    "action_type": "angle"
+  },
+
+  "data": {
+    "data_dir": "data_human_ego/hd-epic-dataset-vla-lerobot",
+    "main_image_col": "observation.images.main",
+    "action_col": "action",
+    "state_col": "observation.state",
+    "instruction_col": "language_instruction",
+    "default_instruction": "Navigate to the target location.",
+    "waypoint_horizon": 16,
+    "waypoint_xy_norm": "per_step",
+    "camera_fov_rad": 1.73,
+    "train_episode_ratio": 0.95,
+    "num_workers": 4
+  }
+}

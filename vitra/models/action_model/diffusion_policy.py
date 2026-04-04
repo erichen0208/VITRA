@@ -5,6 +5,23 @@ from vitra.datasets.dataset_utils import ActionFeature, get_robot_7d_loss_compon
 import torch
 from torch import nn
 
+
+def _build_navigation_time_weights(window: int, time_weights=None, tail_boost: float = 0.0):
+    if window <= 0:
+        return None
+    if time_weights is not None:
+        tw = torch.tensor(time_weights, dtype=torch.float32)
+        if tw.numel() != window:
+            raise ValueError(f"navigation_time_weights must have length {window}, got {tw.numel()}")
+    else:
+        # Uniform baseline with optional linear emphasis on farther waypoints.
+        tw = torch.ones(window, dtype=torch.float32)
+        if float(tail_boost) > 0.0 and window > 1:
+            tw = tw + float(tail_boost) * torch.linspace(0.0, 1.0, window)
+
+    tw = tw / max(float(tw.mean()), 1e-6)
+    return tw
+
 def DiT_T(**kwargs):
     return DiT(depth=3, hidden_size=256, num_heads=4, **kwargs)
 def DiT_S(**kwargs):
@@ -32,6 +49,10 @@ class DiffusionPolicy(nn.Module):
         state_dim=None,
         loss_type='human',
         use_wrist_cross_attn=False,
+        navigation_time_weights=None,
+        navigation_tail_boost=0.0,
+        navigation_straight_alpha=0.0,
+        navigation_straight_decay_deg=15.0,
     ):
         super().__init__()
         # SimpleMLP takes in x_t, timestep, and condition, and outputs predicted noise.
@@ -54,6 +75,13 @@ class DiffusionPolicy(nn.Module):
         self.future_action_window_size = future_action_window_size
         self.use_state = use_state
         self.action_type = action_type
+        self.navigation_time_weights = _build_navigation_time_weights(
+            self.future_action_window_size,
+            time_weights=navigation_time_weights,
+            tail_boost=navigation_tail_boost,
+        )
+        self.navigation_straight_alpha = float(navigation_straight_alpha)
+        self.navigation_straight_decay_deg = float(max(navigation_straight_decay_deg, 1e-6))
         
         # Get loss components and hand group mapping from ActionFeature
         if loss_type == 'human':
@@ -64,6 +92,27 @@ class DiffusionPolicy(nn.Module):
             self.loss_components = ActionFeature.get_xhand_loss_components()
         elif loss_type == 'robot_7d':
             self.loss_components = get_robot_7d_loss_components()
+        elif loss_type == 'navigation':
+            # Navigation control.
+            # Preferred target layout: [x, y, sin(theta), cos(theta)] so that
+            # heading is continuous across +/-pi boundary.
+            if in_channels >= 4:
+                self.loss_components = {
+                    "delta_xy": (0, 2, 2.0),
+                    "heading_sincos": (2, 4, 1.5),
+                }
+                if in_channels > 4:
+                    self.loss_components["aux"] = (4, in_channels, 1.0)
+            elif in_channels >= 3:
+                # Backward compatibility for [x, y, theta]-style targets.
+                self.loss_components = {
+                    "delta_xy": (0, 2, 2.0),
+                    "yaw": (2, 3, 1.5),
+                }
+            else:
+                self.loss_components = {
+                    "action": (0, in_channels, 1.0),
+                }
         else:
             raise ValueError(f"Unknown loss_type: {loss_type}")
         self.net = DiT_models[model_type](
@@ -96,11 +145,61 @@ class DiffusionPolicy(nn.Module):
 
         # L2 loss with mask
         square_delta = (noise_pred - noise) ** 2 * x_mask
+
+        time_weights = None
+        if self.loss_components is not None and self.navigation_time_weights is not None and "delta_xy" in self.loss_components:
+            tw = self.navigation_time_weights.to(x.device)
+            if tw.numel() == x.shape[1] - 1:
+                # VITRA keeps future_action_window_size=chunk_size-1 while action
+                # supervision is chunk_size; extend the last weight for the extra step.
+                tw = torch.cat([tw, tw[-1:].clone()], dim=0)
+            elif tw.numel() != x.shape[1]:
+                raise ValueError(
+                    f"navigation_time_weights length {tw.numel()} incompatible with action horizon {x.shape[1]}"
+                )
+            time_weights = tw.view(1, -1, 1)
+
+        sample_weights = None
+        if (
+            self.loss_components is not None
+            and "delta_xy" in self.loss_components
+            and self.navigation_straight_alpha > 0.0
+            and x.shape[1] >= 2
+        ):
+            # Build per-sample weights from GT heading changes so straighter clips
+            # (smaller cumulative rotation) contribute more to the training loss.
+            if x.shape[2] >= 4:
+                yaw = torch.atan2(x[:, :, 2], x[:, :, 3])
+            elif x.shape[2] >= 3:
+                yaw = x[:, :, 2]
+            else:
+                yaw = None
+
+            if yaw is not None:
+                dyaw = yaw[:, 1:] - yaw[:, :-1]
+                dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))
+                valid_t = x_mask.any(dim=-1).float()
+                valid_pair = valid_t[:, 1:] * valid_t[:, :-1]
+
+                rot_abs_deg = dyaw.abs() * (180.0 / torch.pi)
+                denom = valid_pair.sum(dim=1).clamp_min(1.0)
+                mean_rot_deg = (rot_abs_deg * valid_pair).sum(dim=1) / denom
+
+                straight_factor = torch.exp(-mean_rot_deg / self.navigation_straight_decay_deg)
+                sample_weights = 1.0 + self.navigation_straight_alpha * straight_factor
+                sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-6)
+                sample_weights = sample_weights.view(-1, 1, 1)
         
         # Generic mask loss computation function
         def mask_loss(from_dim, to_dim):
-            s = square_delta[:, :, from_dim:to_dim].sum()
-            n = x_mask[:, :, from_dim:to_dim].sum()
+            if time_weights is None:
+                w = 1.0
+            else:
+                w = time_weights
+            if sample_weights is not None:
+                w = w * sample_weights
+            s = (square_delta[:, :, from_dim:to_dim] * w).sum()
+            n = (x_mask[:, :, from_dim:to_dim] * w).sum()
             return s / n if n > 0 else 0
         
         # Compute loss for each component using ActionFeature definitions

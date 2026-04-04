@@ -144,6 +144,10 @@ class VITRA_Paligemma(nn.Module):
             state_dim = self.configs["state_encoder"]["state_dim"] if self.use_state=='DiT' else None,
             loss_type = self.configs.get("loss_type", "human"),
             use_wrist_cross_attn = use_wrist_cross_attn,
+            navigation_time_weights = self.act_model_configs.get("navigation_time_weights"),
+            navigation_tail_boost = self.act_model_configs.get("navigation_tail_boost", 0.0),
+            navigation_straight_alpha = self.act_model_configs.get("navigation_straight_alpha", 0.0),
+            navigation_straight_decay_deg = self.act_model_configs.get("navigation_straight_decay_deg", 15.0),
         )
 
         for param in action_head.parameters():

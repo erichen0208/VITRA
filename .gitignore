@@ -196,3 +196,4 @@ benchmark*/
 examples/custom
 examples/distance
 checkpoints/
+debug/
